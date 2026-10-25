@@ -20,6 +20,7 @@ on:
         options:
           - all
           - windows
+          - windows-arm64
           - macos
           - linux
         default: all
@@ -476,97 +477,7 @@ jobs:
         shell: pwsh
         env:
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
-        run: |
-          $msiRelativePath = "composeApp\build\compose\release-msis\Nuvio-Windows-x64-$env:RELEASE_VERSION.msi"
-          if (-not (Test-Path $msiRelativePath)) {
-            throw "Expected MSI was not produced: $msiRelativePath"
-          }
-          $msiPath = (Resolve-Path $msiRelativePath).Path
-          $extractDir = Join-Path $env:RUNNER_TEMP "nuvio-msi-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $extractLog = Join-Path $env:RUNNER_TEMP "nuvio-msi-extract.log"
-          New-Item -ItemType Directory -Path $extractDir | Out-Null
-
-          $extractArguments = @(
-            "/a",
-            "`"$msiPath`"",
-            "/qn",
-            "TARGETDIR=`"$extractDir`"",
-            "/l*v",
-            "`"$extractLog`""
-          )
-          $extractProcess = Start-Process `
-            -FilePath msiexec.exe `
-            -ArgumentList $extractArguments `
-            -Wait `
-            -PassThru
-          if ($extractProcess.ExitCode -ne 0) {
-            Get-Content $extractLog -Tail 200
-            throw "MSI administrative extraction failed with exit code $($extractProcess.ExitCode)."
-          }
-
-          $appJar = Get-ChildItem $extractDir `
-            -Recurse `
-            -Filter "composeApp-desktop-*.jar" `
-            | Select-Object -First 1
-          if ($null -eq $appJar) {
-            throw "The extracted MSI does not contain the desktop application JAR."
-          }
-
-          $jarEntries = & jar tf $appJar.FullName
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not inspect the extracted desktop application JAR."
-          }
-          $requiredEntries = @(
-            "native/windows/player_bridge.dll",
-            "native/windows/libmpv-2.dll",
-            "native/windows/WebView2Loader.dll",
-            "native/windows/vcruntime140.dll",
-            "native/windows/msvcp140.dll",
-            "native/windows/runtime-files.txt",
-            "native/windows/nuvio_engine.dll"
-          )
-          foreach ($entry in $requiredEntries) {
-            if ($jarEntries -notcontains $entry) {
-              throw "The extracted MSI application is missing $entry"
-            }
-          }
-
-          $javaRuntimeJvm = Get-ChildItem $extractDir `
-            -Recurse `
-            -Filter "jvm.dll" `
-            | Where-Object { $_.FullName -match "[\\/]runtime[\\/]bin[\\/]server[\\/]jvm\.dll$" } `
-            | Select-Object -First 1
-          if ($null -eq $javaRuntimeJvm) {
-            throw "The extracted MSI does not contain the bundled Java runtime."
-          }
-
-          $manifestPath = "composeApp\build\compose\release-msis\Nuvio-Windows-x64-$env:RELEASE_VERSION-contents.txt"
-          $extractedFiles = Get-ChildItem $extractDir -Recurse -File | Sort-Object FullName
-          $nativeEntries = $jarEntries `
-            | Where-Object { $_ -like "native/windows/*" } `
-            | Sort-Object
-          $manifest = [Collections.Generic.List[string]]::new()
-          $manifest.Add("MSI=Nuvio-Windows-x64-$env:RELEASE_VERSION.msi")
-          $manifest.Add("MSI_SHA256=$((Get-FileHash $msiPath -Algorithm SHA256).Hash.ToLowerInvariant())")
-          $manifest.Add("MSI_SIGNATURE_STATUS=$((Get-AuthenticodeSignature $msiPath).Status)")
-          $manifest.Add("EXTRACTED_FILE_COUNT=$($extractedFiles.Count)")
-          $manifest.Add("APP_JAR=$([IO.Path]::GetRelativePath($extractDir, $appJar.FullName).Replace('\', '/'))")
-          $manifest.Add("JAVA_RUNTIME_JVM=$([IO.Path]::GetRelativePath($extractDir, $javaRuntimeJvm.FullName).Replace('\', '/'))")
-          $manifest.Add("")
-          $manifest.Add("NATIVE_JAR_ENTRIES")
-          foreach ($entry in $nativeEntries) {
-            $manifest.Add($entry)
-          }
-          $manifest.Add("")
-          $manifest.Add("EXTRACTED_FILES")
-          foreach ($file in $extractedFiles) {
-            $relativePath = [IO.Path]::GetRelativePath($extractDir, $file.FullName).Replace('\', '/')
-            $manifest.Add("$relativePath`t$($file.Length)")
-          }
-          $manifest | Set-Content $manifestPath -Encoding utf8
-
-          Get-Item $msiPath | Format-List Name, Length, LastWriteTime
-          $manifest | Select-Object -First (9 + $nativeEntries.Count)
+        run: ./scripts/windows/verify-msi.ps1 -Arch x64 -Version $env:RELEASE_VERSION
 
       - name: Upload MSI
         uses: actions/upload-artifact@v7
@@ -575,6 +486,123 @@ jobs:
           path: |
             composeApp/build/compose/release-msis/Nuvio-Windows-x64-${{ needs.metadata.outputs.version }}.msi
             composeApp/build/compose/release-msis/Nuvio-Windows-x64-${{ needs.metadata.outputs.version }}-contents.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  windows_arm64_natives:
+    name: Windows arm64 - native libraries
+    if: inputs.mode != 'dry-run' && (inputs.target == 'all' || inputs.target == 'windows' || inputs.target == 'windows-arm64')
+    needs: metadata
+    # nuvio-engine's Windows cross toolchain image is linux/arm64.
+    runs-on: ubuntu-24.04-arm
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Optional pins for the mpv-dev-aarch64 archive; otherwise the latest
+      # shinchiro/mpv-winbuild-cmake release is used and its sha256 recorded in SOURCES.txt.
+      LIBMPV_ARM64_URL: ${{ vars.LIBMPV_ARM64_URL }}
+      LIBMPV_ARM64_SHA256: ${{ vars.LIBMPV_ARM64_SHA256 }}
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends cmake ninja-build p7zip-full
+          python3 -m pip install --user --break-system-packages ziglang==0.17.0
+
+      - name: Build ARM64 native libraries
+        run: ./scripts/windows/prepare-arm64-natives.sh "${RUNNER_TEMP}/arm64-natives"
+
+      - name: Upload ARM64 native libraries
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-arm64-native-libraries
+          path: ${{ runner.temp }}/arm64-natives
+          if-no-files-found: error
+          retention-days: 7
+
+  windows_arm64:
+    name: Windows arm64
+    if: inputs.mode != 'dry-run' && (inputs.target == 'all' || inputs.target == 'windows' || inputs.target == 'windows-arm64')
+    needs:
+      - metadata
+      - windows_arm64_natives
+    runs-on: windows-11-arm
+    environment: desktop-release
+    env:
+      LOCAL_PROPERTIES_BASE64: ${{ secrets.NUVIO_DESKTOP_LOCAL_PROPERTIES_BASE64 }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_DESKTOP_DSN: ${{ secrets.SENTRY_DESKTOP_DSN }}
+      WEBVIEW2_VERSION: 1.0.4078.44
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+
+      - name: Download ARM64 native libraries
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-arm64-native-libraries
+          path: ${{ runner.temp }}/arm64-natives
+
+      # A native ARM64 JDK is what makes this build native: jpackage bundles the JDK
+      # that runs Gradle, and skiko/JNA pick their windows-arm64 natives from os.arch.
+      - name: Set up Java (ARM64)
+        uses: actions/setup-java@v5
+        with:
+          distribution: microsoft
+          java-version: 21
+          architecture: aarch64
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Configure desktop runtime
+        shell: bash
+        run: bash ./scripts/linux/configure-desktop-runtime.sh
+
+      - name: Install WebView2 SDK
+        shell: pwsh
+        run: ./scripts/windows/install-webview2-sdk.ps1 -Version $env:WEBVIEW2_VERSION -Arch arm64
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $natives = Join-Path $env:RUNNER_TEMP "arm64-natives"
+          Get-Content (Join-Path $natives "SOURCES.txt")
+          & .\gradlew.bat `
+            :composeApp:packageReleaseMsi `
+            "-Pnuvio.webview2.dir=$env:WEBVIEW2_ROOT" `
+            "-Pnuvio.windows.libmpv.runtimeDir=$(Join-Path $natives 'libmpv')" `
+            "-Pnuvio.windows.engine.dll=$(Join-Path $natives 'engine\nuvio_engine.dll')" `
+            "-Pnuvio.windows.quickjs.dll=$(Join-Path $natives 'quickjs\libquickjs.dll')" `
+            "-Pcompose.desktop.packaging.checkJdkVendor=false" `
+            --no-configuration-cache `
+            --no-daemon `
+            --stacktrace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify MSI
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: ./scripts/windows/verify-msi.ps1 -Arch arm64 -Version $env:RELEASE_VERSION
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuvio-desktop-${{ needs.metadata.outputs.version }}-windows-arm64
+          path: |
+            composeApp/build/compose/release-msis/Nuvio-Windows-arm64-${{ needs.metadata.outputs.version }}.msi
+            composeApp/build/compose/release-msis/Nuvio-Windows-arm64-${{ needs.metadata.outputs.version }}-contents.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -1021,6 +1049,7 @@ jobs:
       - metadata
       - macos
       - windows
+      - windows_arm64
       - linux_flatpak
       - linux_deb
       - linux_rpm
@@ -1047,6 +1076,7 @@ jobs:
             "release/Nuvio-macOS-arm64-${RELEASE_VERSION}.dmg"
             "release/Nuvio-macOS-x86_64-${RELEASE_VERSION}.dmg"
             "release/Nuvio-Windows-x64-${RELEASE_VERSION}.msi"
+            "release/Nuvio-Windows-arm64-${RELEASE_VERSION}.msi"
             "release/Nuvio-Linux-x86_64-${RELEASE_VERSION}.flatpak"
             "release/Nuvio-Linux-x86_64-${RELEASE_VERSION}.deb"
             "release/Nuvio-Linux-x86_64-${RELEASE_VERSION}.rpm"
@@ -1076,6 +1106,7 @@ jobs:
             "release/Nuvio-macOS-arm64-${RELEASE_VERSION}.dmg"
             "release/Nuvio-macOS-x86_64-${RELEASE_VERSION}.dmg"
             "release/Nuvio-Windows-x64-${RELEASE_VERSION}.msi"
+            "release/Nuvio-Windows-arm64-${RELEASE_VERSION}.msi"
             "release/Nuvio-Linux-x86_64-${RELEASE_VERSION}.flatpak"
             "release/Nuvio-Linux-x86_64-${RELEASE_VERSION}.deb"
             "release/Nuvio-Linux-x86_64-${RELEASE_VERSION}.rpm"

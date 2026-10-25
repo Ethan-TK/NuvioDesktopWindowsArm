@@ -9,6 +9,14 @@
 #include <wrl.h>
 #include <WebView2.h>
 #include <jni.h>
+// Windows media controls (System Media Transport Controls): C++/WinRT from the Windows SDK.
+// unknwn.h first so C++/WinRT enables classic-COM interop (needed for the HWND interop interface).
+#include <unknwn.h>
+#include <systemmediatransportcontrolsinterop.h>
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.h>
+#include <winrt/Windows.Storage.Streams.h>
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +26,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cwctype>
 #include <deque>
 #include <functional>
@@ -500,6 +509,14 @@ std::string mpvShaderCacheDirectory() {
     }
 }
 
+#if defined(_M_ARM64) || defined(__aarch64__)
+// Windows on ARM (Snapdragon/Adreno): no NVIDIA adapters, and D3D11 is the most mature
+// driver path for both presentation and hardware decode.
+constexpr bool kWindowsArm64 = true;
+#else
+constexpr bool kWindowsArm64 = false;
+#endif
+
 bool unifiedMemoryGpu() {
     static const bool unified = []() {
         ComPtr<ID3D11Device> device;
@@ -626,6 +643,180 @@ MpvApi &mpvApi() {
 }
 
 class WindowsMpvWebPlayer;
+
+// Bridges playback into Windows' media controls: the volume/media flyout, lock screen, and the
+// hardware media keys. Windows routes those keys to the app that owns the active session, so this
+// also makes keyboard play/pause/next/previous work while Nuvio is in the background.
+// Every WinRT call is wrapped: a missing or broken media stack must never affect playback.
+class WindowsMediaControls {
+public:
+    using ButtonCallback = std::function<void(const char *action)>;
+    using SeekCallback = std::function<void(long long positionMs)>;
+
+    // Binds to the top-level window. Re-binds if the player moved to another window (e.g. PiP).
+    void attach(HWND window, ButtonCallback onButton, SeekCallback onSeek) {
+        if (!window || window == attachedWindow) return;
+        detach();
+        try {
+            using namespace winrt::Windows::Media;
+            auto interop = winrt::get_activation_factory<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>();
+            SystemMediaTransportControls controls{nullptr};
+            winrt::check_hresult(interop->GetForWindow(
+                window,
+                winrt::guid_of<SystemMediaTransportControls>(),
+                winrt::put_abi(controls)
+            ));
+            controls.IsEnabled(true);
+            controls.IsPlayEnabled(true);
+            controls.IsPauseEnabled(true);
+            controls.IsNextEnabled(true);
+            controls.IsPreviousEnabled(true);
+            controls.IsFastForwardEnabled(true);
+            controls.IsRewindEnabled(true);
+            controls.IsStopEnabled(false);
+            controls.PlaybackStatus(MediaPlaybackStatus::Changing);
+            controls.DisplayUpdater().Type(MediaPlaybackType::Video);
+
+            buttonToken = controls.ButtonPressed(
+                [onButton](SystemMediaTransportControls const &,
+                           SystemMediaTransportControlsButtonPressedEventArgs const &args) {
+                    try {
+                        switch (args.Button()) {
+                            case SystemMediaTransportControlsButton::Play: onButton("play"); break;
+                            case SystemMediaTransportControlsButton::Pause: onButton("pause"); break;
+                            case SystemMediaTransportControlsButton::Next:
+                            case SystemMediaTransportControlsButton::FastForward: onButton("keyboardSeekForward"); break;
+                            case SystemMediaTransportControlsButton::Previous:
+                            case SystemMediaTransportControlsButton::Rewind: onButton("keyboardSeekBack"); break;
+                            default: break;
+                        }
+                    } catch (...) {
+                    }
+                }
+            );
+            seekToken = controls.PlaybackPositionChangeRequested(
+                [onSeek](SystemMediaTransportControls const &,
+                         PlaybackPositionChangeRequestedEventArgs const &args) {
+                    try {
+                        auto position = std::chrono::duration_cast<std::chrono::milliseconds>(args.RequestedPlaybackPosition());
+                        onSeek((long long)position.count());
+                    } catch (...) {
+                    }
+                }
+            );
+            smtc = controls;
+            attachedWindow = window;
+            lastStatusPaused = -1;
+            lastTimelineDurationMs = -1;
+            applyDisplay();
+        } catch (...) {
+            smtc = nullptr;
+            attachedWindow = nullptr;
+        }
+    }
+
+    void detach() {
+        if (!smtc) {
+            attachedWindow = nullptr;
+            return;
+        }
+        try {
+            if (buttonToken.value) smtc.ButtonPressed(buttonToken);
+            if (seekToken.value) smtc.PlaybackPositionChangeRequested(seekToken);
+            smtc.PlaybackStatus(winrt::Windows::Media::MediaPlaybackStatus::Closed);
+            smtc.DisplayUpdater().ClearAll();
+            smtc.DisplayUpdater().Update();
+            smtc.IsEnabled(false);
+        } catch (...) {
+        }
+        buttonToken = {};
+        seekToken = {};
+        smtc = nullptr;
+        attachedWindow = nullptr;
+    }
+
+    void setMetadata(const std::string &newTitle, const std::string &newSubtitle, const std::string &newArtworkUrl) {
+        if (newTitle == title && newSubtitle == subtitle && newArtworkUrl == artworkUrl) return;
+        title = newTitle;
+        subtitle = newSubtitle;
+        artworkUrl = newArtworkUrl;
+        applyDisplay();
+    }
+
+    // Called from the player's 500 ms UI timer. Status is pushed on change; the timeline is pushed
+    // on duration change, on a seek, or every ~5 s (Windows extrapolates position in between).
+    void update(bool paused, long long positionMs, long long durationMs) {
+        if (!smtc) return;
+        try {
+            using namespace winrt::Windows::Media;
+            int pausedFlag = paused ? 1 : 0;
+            if (pausedFlag != lastStatusPaused) {
+                smtc.PlaybackStatus(paused ? MediaPlaybackStatus::Paused : MediaPlaybackStatus::Playing);
+                lastStatusPaused = pausedFlag;
+            }
+            if (durationMs <= 0) return;
+            auto now = std::chrono::steady_clock::now();
+            long long expected = lastTimelinePositionMs;
+            if (!paused) {
+                expected += std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTimelinePushedAt).count();
+            }
+            bool seeked = std::llabs(positionMs - expected) > 2000;
+            bool stale = now - lastTimelinePushedAt > std::chrono::seconds(5);
+            if (durationMs != lastTimelineDurationMs || seeked || stale) {
+                SystemMediaTransportControlsTimelineProperties timeline;
+                timeline.StartTime(winrt::Windows::Foundation::TimeSpan{0});
+                timeline.MinSeekTime(winrt::Windows::Foundation::TimeSpan{0});
+                timeline.EndTime(std::chrono::milliseconds(durationMs));
+                timeline.MaxSeekTime(std::chrono::milliseconds(durationMs));
+                timeline.Position(std::chrono::milliseconds(std::clamp(positionMs, 0LL, durationMs)));
+                smtc.UpdateTimelineProperties(timeline);
+                lastTimelineDurationMs = durationMs;
+                lastTimelinePositionMs = positionMs;
+                lastTimelinePushedAt = now;
+            }
+        } catch (...) {
+        }
+    }
+
+private:
+    winrt::Windows::Media::SystemMediaTransportControls smtc{nullptr};
+    HWND attachedWindow = nullptr;
+    winrt::event_token buttonToken{};
+    winrt::event_token seekToken{};
+    std::string title;
+    std::string subtitle;
+    std::string artworkUrl;
+    int lastStatusPaused = -1;
+    long long lastTimelineDurationMs = -1;
+    long long lastTimelinePositionMs = 0;
+    std::chrono::steady_clock::time_point lastTimelinePushedAt{};
+
+    void applyDisplay() {
+        if (!smtc) return;
+        try {
+            using namespace winrt::Windows::Media;
+            auto updater = smtc.DisplayUpdater();
+            updater.Type(MediaPlaybackType::Video);
+            auto video = updater.VideoProperties();
+            video.Title(winrt::hstring(toWide(title.empty() ? std::string("Nuvio") : title)));
+            video.Subtitle(winrt::hstring(toWide(subtitle)));
+            if (!artworkUrl.empty()) {
+                // Windows downloads the artwork itself; an invalid URL just leaves no thumbnail.
+                try {
+                    updater.Thumbnail(winrt::Windows::Storage::Streams::RandomAccessStreamReference::CreateFromUri(
+                        winrt::Windows::Foundation::Uri(winrt::hstring(toWide(artworkUrl)))
+                    ));
+                } catch (...) {
+                    updater.Thumbnail(nullptr);
+                }
+            } else {
+                updater.Thumbnail(nullptr);
+            }
+            updater.Update();
+        } catch (...) {
+        }
+    }
+};
 LRESULT CALLBACK messageWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK containerWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 
@@ -1003,6 +1194,42 @@ public:
         if (shuttingDown.load()) return;
         layoutNativeSubviews();
         syncControls();
+        syncMediaControls();
+    }
+
+    void syncMediaControls() {
+        HWND root = hostHwnd && IsWindow(hostHwnd) ? GetAncestor(hostHwnd, GA_ROOT) : nullptr;
+        if (root) {
+            std::weak_ptr<WindowsMpvWebPlayer> weakSelf = weak_from_this();
+            mediaControls.attach(
+                root,
+                [weakSelf](const char *action) {
+                    auto self = weakSelf.lock();
+                    if (!self || self->shuttingDown.load()) return;
+                    std::string event(action);
+                    // Play/Pause are explicit on Windows; route both through the app's toggle so
+                    // the Kotlin side stays the single source of truth for playback state.
+                    if (event == "play" || event == "pause") {
+                        bool paused = self->isPaused();
+                        if ((event == "play") != paused) return;
+                        event = "keyboardToggle";
+                    }
+                    self->sendPlayerEvent(event, 0.0);
+                },
+                [weakSelf](long long positionMs) {
+                    auto self = weakSelf.lock();
+                    if (!self || self->shuttingDown.load()) return;
+                    self->seekToMilliseconds(positionMs);
+                }
+            );
+        }
+        mediaControls.update(isPaused(), positionMs(), durationMs());
+    }
+
+    void setNowPlayingMetadata(const std::string &title, const std::string &subtitle, const std::string &artworkUrl) {
+        postUiTask([self = shared_from_this(), title, subtitle, artworkUrl]() {
+            self->mediaControls.setMetadata(title, subtitle, artworkUrl);
+        });
     }
 
     void updateControlsJson(const std::string &controlsJson) {
@@ -1396,6 +1623,9 @@ private:
     std::atomic_bool shuttingDown = false;
     std::atomic_bool hwdecLogged = false;  // one-shot log for hwdec-current
 
+    // Touched only on the native UI thread (timer, cleanup, posted tasks).
+    WindowsMediaControls mediaControls;
+
     bool hasAppliedSubtitleStyle = false;
     bool appliedSubtitleUseLibass = false;
     std::string appliedSubtitleTextColor;
@@ -1526,6 +1756,7 @@ private:
         if (messageHwnd) {
             KillTimer(messageHwnd, NUVIO_TIMER_ID);
         }
+        mediaControls.detach();
         if (webView && messageToken.value != 0) {
             webView->remove_WebMessageReceived(messageToken);
             messageToken.value = 0;
@@ -1713,6 +1944,10 @@ private:
         bool nvidiaRtxSuperResolutionEnabled
     ) {
         MpvApi &api = mpvApi();
+        if (kWindowsArm64) {
+            // RTX Video Super Resolution needs an NVIDIA adapter, which ARM64 Windows never has.
+            nvidiaRtxSuperResolutionEnabled = false;
+        }
         bool fastProfile = !nvidiaRtxSuperResolutionEnabled && unifiedMemoryGpu();
         {
             std::lock_guard<std::mutex> lock(mpvMutex);
@@ -1724,6 +1959,21 @@ private:
 
             setMpvOptionStringLocked("config", "no");
             setMpvOptionStringLocked("osc", "no");
+            if (kWindowsArm64) {
+                // libmpv's LuaJIT can't unwind its error exceptions on Windows ARM64: any Lua error
+                // (even one a script catches, e.g. ytdl_hook probing a stream URL) is raised as
+                // SEH exception 0xE24C4A02 and kills the process. The bridge drives mpv entirely
+                // through the client API, so turn off every built-in Lua script.
+                setMpvOptionStringLocked("load-scripts", "no");
+                setMpvOptionStringLocked("ytdl", "no");
+                setMpvOptionStringLocked("load-stats-overlay", "no");
+                setMpvOptionStringLocked("load-console", "no");
+                setMpvOptionStringLocked("load-auto-profiles", "no");
+                setMpvOptionStringLocked("load-select", "no");
+                setMpvOptionStringLocked("load-commands", "no");
+                setMpvOptionStringLocked("load-positioning", "no");
+                setMpvOptionStringLocked("load-context-menu", "no");
+            }
             setMpvOptionStringLocked("input-default-bindings", "yes");
             setMpvOptionStringLocked("input-vo-keyboard", "no");
             setMpvOptionStringLocked("keep-open", "yes");
@@ -1733,6 +1983,12 @@ private:
                 setMpvOptionStringLocked("gpu-api", "d3d11");
                 setMpvOptionStringLocked("hwdec", "d3d11va");
                 setMpvOptionStringLocked("d3d11-adapter", "NVIDIA");
+            } else if (kWindowsArm64) {
+                // Pin D3D11 instead of "auto" so mpv never falls through to Adreno's less mature
+                // Vulkan/OpenGL drivers; d3d11va keeps decoded frames on the GPU (zero-copy),
+                // which matters most for battery on ARM laptops. auto-safe remains as fallback.
+                setMpvOptionStringLocked("gpu-api", "d3d11");
+                setMpvOptionStringLocked("hwdec", "d3d11va,auto-safe");
             } else {
                 setMpvOptionStringLocked("gpu-api", "auto");
                 setMpvOptionStringLocked("hwdec", "auto");
@@ -1751,7 +2007,9 @@ private:
             } else {
                 setMpvOptionStringLocked("vd-lavc-software-fallback", "yes");
             }
-            setMpvOptionStringLocked("vd-lavc-threads", "4");
+            // Software fallback (e.g. codecs the GPU can't decode): Snapdragon parts have 8-12
+            // fast cores, so let FFmpeg size its thread pool instead of capping at 4.
+            setMpvOptionStringLocked("vd-lavc-threads", kWindowsArm64 ? "0" : "4");
             setMpvOptionStringLocked("tone-mapping", "bt.2390");
             setMpvOptionStringLocked("dither-depth", "auto");
             if (fastProfile) {
@@ -2468,6 +2726,24 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_updateControls(JNI
     auto player = playerFromHandle(handle);
     std::string controlsJsonText = jstringToUtf8(env, controlsJson);
     if (player) player->updateControlsJson(controlsJsonText);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setNowPlayingMetadata(
+    JNIEnv *env,
+    jobject,
+    jlong handle,
+    jstring title,
+    jstring subtitle,
+    jstring artworkUrl
+) {
+    auto player = playerFromHandle(handle);
+    if (!player) return;
+    player->setNowPlayingMetadata(
+        jstringToUtf8(env, title),
+        jstringToUtf8(env, subtitle),
+        jstringToUtf8(env, artworkUrl)
+    );
 }
 
 extern "C" JNIEXPORT void JNICALL

@@ -155,6 +155,13 @@ fun main(args: Array<String>) {
                 // Windows fullscreen is emulated natively and isn't reflected by
                 // WindowPlacement, so it must be re-applied once the window peer exists.
                 fullscreenController.applyRestoredFullscreenState(window, windowState, wasFullscreenOnLastExit)
+                // Which Skia backend Compose actually got (DIRECT3D/ANGLE/SOFTWARE_*): a silent
+                // fallback to software rendering shows up as UI stutter, notably on Windows on ARM.
+                kotlinx.coroutines.delay(2_000)
+                println(
+                    "NuvioRenderer: renderApi=${window.renderApi} os.arch=${System.getProperty("os.arch")} " +
+                        "skiko.renderApi=${System.getProperty("skiko.renderApi")}",
+                )
             }
             LaunchedEffect(windowState) {
                 // Covers OS-driven placement changes too (e.g. the native macOS

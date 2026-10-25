@@ -11,9 +11,11 @@ internal object DesktopEngineLibrary {
         requireSupportedArchitecture(platform)
         val directory = directoryName(platform)
         val name = libraryName(platform)
+        // The jar resource is packaged for the build's architecture; the checked-in source copy
+        // is x64-only, so it must not win over the jar when running from source on ARM64.
         return packagedLibrary(directory, name)
-            ?: sourceLibrary(directory, name)
             ?: extractedLibrary(directory, name)
+            ?: sourceLibrary(directory, name)
             ?: throw P2pStreamingException("The torrent engine library is not bundled for $directory")
     }
 
@@ -34,7 +36,13 @@ internal object DesktopEngineLibrary {
     private fun requireSupportedArchitecture(platform: DesktopHostOs) {
         if (platform == DesktopHostOs.MACOS) return
         val architecture = System.getProperty("os.arch").orEmpty().lowercase(Locale.ROOT)
-        if (architecture !in setOf("amd64", "x86_64", "x64")) {
+        // Windows on ARM ships a native aarch64 engine build (nuvio-engine supports it);
+        // if it is not bundled, resolve() still fails cleanly with "not bundled".
+        val supported = when (platform) {
+            DesktopHostOs.WINDOWS -> setOf("amd64", "x86_64", "x64", "aarch64", "arm64")
+            else -> setOf("amd64", "x86_64", "x64")
+        }
+        if (architecture !in supported) {
             throw P2pStreamingException("P2P streaming is not available for $architecture")
         }
     }

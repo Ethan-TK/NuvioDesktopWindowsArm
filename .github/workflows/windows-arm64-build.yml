@@ -1,0 +1,130 @@
+name: Windows ARM64 Test Build
+
+# Standalone, secrets-optional build of a native Windows on ARM (arm64) MSI.
+# Useful on forks and for testing ARM64 changes without running the full release.
+# If NUVIO_DESKTOP_LOCAL_PROPERTIES_BASE64 is not available, the app is built without
+# account/sync configuration (local playback, addons and plugins still work).
+
+on:
+  workflow_dispatch:
+    inputs:
+      libmpv_url:
+        description: Optional explicit mpv-dev-aarch64-*.7z URL (defaults to latest shinchiro build)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  natives:
+    name: ARM64 native libraries
+    runs-on: ubuntu-24.04-arm
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LIBMPV_ARM64_URL: ${{ inputs.libmpv_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends cmake ninja-build p7zip-full
+          python3 -m pip install --user --break-system-packages ziglang==0.17.0
+
+      - name: Build ARM64 native libraries
+        run: ./scripts/windows/prepare-arm64-natives.sh "${RUNNER_TEMP}/arm64-natives"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-arm64-native-libraries
+          path: ${{ runner.temp }}/arm64-natives
+          if-no-files-found: error
+          retention-days: 7
+
+  msi:
+    name: Windows arm64 MSI
+    needs: natives
+    runs-on: windows-11-arm
+    env:
+      LOCAL_PROPERTIES_BASE64: ${{ secrets.NUVIO_DESKTOP_LOCAL_PROPERTIES_BASE64 }}
+      WEBVIEW2_VERSION: 1.0.4078.44
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-arm64-native-libraries
+          path: ${{ runner.temp }}/arm64-natives
+
+      - name: Set up Java (ARM64)
+        uses: actions/setup-java@v5
+        with:
+          distribution: microsoft
+          java-version: 21
+          architecture: aarch64
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Configure desktop runtime (optional)
+        shell: bash
+        run: |
+          if [[ -n "${LOCAL_PROPERTIES_BASE64}" ]]; then
+            printf '%s' "${LOCAL_PROPERTIES_BASE64}" | base64 --decode > local.properties
+            sed -i -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_[A-Z_]+|NUVIO_MACOS_[A-Z_]+)[[:space:]]*=/d' local.properties
+          else
+            echo "::warning::No local.properties secret; building without account/sync configuration."
+          fi
+
+      - name: Install WebView2 SDK
+        shell: pwsh
+        run: ./scripts/windows/install-webview2-sdk.ps1 -Version $env:WEBVIEW2_VERSION -Arch arm64
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          java -XshowSettings:properties -version 2>&1 | Select-String "os.arch|java.vendor|java.version"
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $natives = Join-Path $env:RUNNER_TEMP "arm64-natives"
+          Get-Content (Join-Path $natives "SOURCES.txt")
+          & .\gradlew.bat `
+            :composeApp:packageReleaseMsi `
+            "-Pnuvio.webview2.dir=$env:WEBVIEW2_ROOT" `
+            "-Pnuvio.windows.libmpv.runtimeDir=$(Join-Path $natives 'libmpv')" `
+            "-Pnuvio.windows.engine.dll=$(Join-Path $natives 'engine\nuvio_engine.dll')" `
+            "-Pnuvio.windows.quickjs.dll=$(Join-Path $natives 'quickjs\libquickjs.dll')" `
+            "-Pcompose.desktop.packaging.checkJdkVendor=false" `
+            --no-configuration-cache `
+            --no-daemon `
+            --stacktrace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify MSI
+        shell: pwsh
+        run: |
+          $version = (Get-Content composeApp\Configuration\DesktopVersion.properties | Where-Object { $_ -like "VERSION_NAME=*" }).Split("=", 2)[1]
+          ./scripts/windows/verify-msi.ps1 -Arch arm64 -Version $version
+          "MSI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Nuvio-Windows-arm64-${{ env.MSI_VERSION }}
+          path: |
+            composeApp/build/compose/release-msis/Nuvio-Windows-arm64-*.msi
+            composeApp/build/compose/release-msis/Nuvio-Windows-arm64-*-contents.txt
+          if-no-files-found: error
+          retention-days: 14

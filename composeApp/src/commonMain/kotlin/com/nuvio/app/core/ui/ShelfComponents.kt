@@ -35,6 +35,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.animation.core.Animatable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -562,24 +564,31 @@ internal fun Modifier.desktopPosterHoverScale(
     if (!enabled || !isDesktop) return this
 
     val hovered by interactionSource.collectIsHoveredAsState()
-    val scale by animateFloatAsState(
-        targetValue = if (hovered) DesktopPosterHoverScale else 1f,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioNoBouncy,
-            stiffness = Spring.StiffnessMediumLow,
-        ),
-        label = "desktop_poster_hover_scale",
-    )
+    // The animated value is read only inside graphicsLayer {}, so the spring runs in the draw phase
+    // instead of recomposing (and re-chaining modifiers on) the card every frame. Composition only
+    // sees hover start/end and animation start/end. Matters while scrolling: cards slide under a
+    // still pointer and each one fires a hover enter/exit.
+    val scale = remember { Animatable(1f) }
+    LaunchedEffect(hovered) {
+        scale.animateTo(
+            targetValue = if (hovered) DesktopPosterHoverScale else 1f,
+            animationSpec = spring(
+                dampingRatio = Spring.DampingRatioNoBouncy,
+                stiffness = Spring.StiffnessMediumLow,
+            ),
+        )
+    }
 
-    val isScaling = hovered || scale != 1f
+    val isScaling = hovered || scale.isRunning
 
     return this
         .then(
             if (isScaling) {
                 Modifier
                     .graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
+                        val current = scale.value
+                        scaleX = current
+                        scaleY = current
                     }
                     .zIndex(1f)
             } else {

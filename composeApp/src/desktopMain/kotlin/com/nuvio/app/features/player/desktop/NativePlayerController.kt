@@ -502,7 +502,8 @@ internal class NativePlayerController(
     }
 
     fun setNowPlayingMetadata(title: String?, subtitle: String?, artworkUrl: String?) {
-        if (DesktopHostOs.current != DesktopHostOs.MACOS) return
+        // macOS: Now Playing / Control Center. Windows: media flyout, lock screen and media keys.
+        if (DesktopHostOs.current != DesktopHostOs.MACOS && DesktopHostOs.current != DesktopHostOs.WINDOWS) return
         currentNowPlayingTitle = title.orEmpty()
         currentNowPlayingSubtitle = subtitle.orEmpty()
         currentArtworkUrl = artworkUrl.orEmpty()

@@ -31,6 +31,7 @@ import coil3.compose.AsyncImagePainter
 import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
 import coil3.request.NullRequestDataException
+import coil3.size.Precision
 import org.jetbrains.skia.Bitmap
 import org.jetbrains.skia.FilterMipmap
 import org.jetbrains.skia.FilterMode
@@ -40,7 +41,6 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 private const val MinCustomDownscaleRatio = 1.08f
-private const val MaxDesktopSourceSizePx = 1536
 private const val MaxScaledBitmapPixels = 1_250_000L
 
 private val IsWindowsDesktop: Boolean =
@@ -179,7 +179,11 @@ private fun Any?.withDesktopImageOptions(
         ImageRequest.Builder(context).data(this)
     }
     builder.apply {
-        if (highQualitySize) size(MaxDesktopSourceSizePx)
+        // No fixed size: Coil resolves the size from layout constraints and decodes near display
+        // size on its IO dispatcher. A fixed 1536px decode left ScaledBitmapPainter downscaling every
+        // poster with mipmaps on the render thread as it scrolled into view (visible jank on
+        // slower-per-core CPUs, e.g. Windows on ARM) and only ~40 posters fit the memory cache.
+        if (highQualitySize) precision(Precision.INEXACT)
         if (animated) {
             extras[NuvioAnimatedImageKey] = true
             memoryCacheKeyExtra("nuvio.animated", "true")

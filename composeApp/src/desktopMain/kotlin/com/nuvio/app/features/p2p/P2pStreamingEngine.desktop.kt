@@ -55,7 +55,13 @@ actual object P2pStreamingEngine {
     private val lifecycleLock = Any()
     private val startMutex = Mutex()
     private val runtime: NuvioEngineRuntime by lazy {
-        NuvioEngineRuntime.load(DesktopEngineLibrary.resolve())
+        try {
+            NuvioEngineRuntime.load(DesktopEngineLibrary.resolve())
+        } catch (error: LinkageError) {
+            // e.g. a DLL for the wrong CPU architecture: surface it as a P2P error instead of
+            // letting UnsatisfiedLinkError escape to the UI thread and take down the app.
+            throw P2pStreamingException("The torrent engine could not be loaded: ${error.message}")
+        }
     }
     private var statsJob: Job? = null
     private var cleanupJob: Job? = null

@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -28,6 +29,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.ui.jelly.JellyNavigationBar
 import com.nuvio.app.features.settings.NavBarStyle
+import dev.chrisbanes.haze.HazeInputScale
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeEffect
 
@@ -49,8 +51,12 @@ internal fun DesktopNavigationBar(
     val isHovered by interactionSource.collectIsHoveredAsState()
     val isHomeSelected = items.first().selected
     val isSettingsSelected = items.last().selected
-    val scrollOffset = scrollState?.totalScrollOffset ?: 0f
-    val isScrolledAwayFromTop = scrollOffset > if (isSettingsSelected) 70f else 35f
+    // derivedStateOf: recompose only when the threshold is crossed, not on every scrolled pixel.
+    val isScrolledAwayFromTop by remember(scrollState, isSettingsSelected) {
+        derivedStateOf {
+            (scrollState?.totalScrollOffset ?: 0f) > if (isSettingsSelected) 70f else 35f
+        }
+    }
     val isFrosted = isHovered || profileSwitcherOpen ||
         ((isHomeSelected || isSettingsSelected) && isScrolledAwayFromTop)
     val labelFraction by animateFloatAsState(
@@ -97,7 +103,12 @@ internal fun DesktopNavigationBar(
                     .clip(RoundedCornerShape(50))
                     .then(
                         if (isFrosted && hazeState != null) {
-                            Modifier.hazeEffect(state = hazeState) { blurRadius = 14.dp }
+                            Modifier.hazeEffect(state = hazeState) {
+                                blurRadius = 14.dp
+                                // Blur a half-resolution copy: visually identical under a 14dp blur,
+                                // ~4x less GPU work per frame while content scrolls underneath.
+                                inputScale = HazeInputScale.Fixed(0.5f)
+                            }
                         } else {
                             Modifier
                         },

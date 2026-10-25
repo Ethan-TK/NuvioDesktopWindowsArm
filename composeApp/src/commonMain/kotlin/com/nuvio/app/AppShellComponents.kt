@@ -99,6 +99,8 @@ import com.nuvio.app.navigation.AppRoute
 import com.nuvio.app.navigation.NuvioNavigator
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.HazeInputScale
+import androidx.compose.runtime.derivedStateOf
 import kotlinx.coroutines.flow.Flow
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.app_brand_name
@@ -338,7 +340,9 @@ internal fun TabletFloatingTopBar(
     val hasSettingsDrawer = selectedTab == AppScreenTab.Settings && (windowWidth == null || windowWidth >= 960.dp)
     val supportsScrollFrostedHaze = selectedTab == AppScreenTab.Home || hasSettingsDrawer
     val scrollThreshold = if (selectedTab == AppScreenTab.Settings) 70f else 35f
-    val isScrolledAwayFromTop = scrollState != null && scrollState.totalScrollOffset > scrollThreshold
+    val isScrolledAwayFromTop by remember(scrollState, scrollThreshold) {
+        derivedStateOf { scrollState != null && scrollState.totalScrollOffset > scrollThreshold }
+    }
     val isScrolled = supportsScrollFrostedHaze && isScrolledAwayFromTop
     val isFrosted = isScrolled || isHovered || isProfileSwitcherOpen
 
@@ -469,6 +473,7 @@ internal fun TabletFloatingTopBar(
                 if (isFrosted && hazeState != null) {
                     Modifier.hazeEffect(state = hazeState) {
                         blurRadius = 14.dp
+                        inputScale = HazeInputScale.Fixed(0.5f)
                     }
                 } else {
                     Modifier

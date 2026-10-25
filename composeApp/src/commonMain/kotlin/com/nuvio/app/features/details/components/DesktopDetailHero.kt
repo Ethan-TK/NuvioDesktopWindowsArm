@@ -61,6 +61,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
+import androidx.compose.ui.graphics.FilterQuality
+import com.nuvio.app.core.ui.rememberCheapBlurModel
 import com.nuvio.app.core.ui.NuvioDesktopImageScaling
 import com.nuvio.app.core.ui.NuvioTokens
 import com.nuvio.app.core.ui.DesktopBackdropVerticalBias
@@ -149,11 +151,15 @@ fun DesktopDetailBackdrop(
         )
         val imageUrl = meta.background ?: meta.poster
         if (imageUrl != null) {
+            // Blurred mode: tiny upscaled source instead of re-blurring a full-resolution backdrop
+            // every frame while the details scroll over it (see CheapBlur.kt).
+            val cheapBlurModel = rememberCheapBlurModel(imageUrl, enabled = blurBackdrop)
             AsyncImage(
-                model = originalTmdbImageUrl(imageUrl),
+                model = if (blurBackdrop) cheapBlurModel else originalTmdbImageUrl(imageUrl),
                 contentDescription = meta.name,
-                desktopAnimation = NuvioDesktopAnimation.Always,
-                modifier = artworkModifier,
+                desktopAnimation = if (blurBackdrop) NuvioDesktopAnimation.Off else NuvioDesktopAnimation.Always,
+                modifier = if (blurBackdrop) backdropModifier else artworkModifier,
+                filterQuality = if (blurBackdrop) FilterQuality.High else null,
                 alignment = BiasAlignment(0f, DesktopBackdropVerticalBias),
                 contentScale = if (useWideArtworkFrame && !cropSideBackdrop) ContentScale.Fit else ContentScale.Crop,
                 desktopImageScaling = NuvioDesktopImageScaling.Disabled,

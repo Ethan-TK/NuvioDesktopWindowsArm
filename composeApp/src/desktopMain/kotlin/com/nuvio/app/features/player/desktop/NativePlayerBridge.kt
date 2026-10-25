@@ -250,9 +250,10 @@ internal object NativePlayerBridge {
             File("composeApp/build/native/$platformDir"),
             File("build/native/$platformDir"),
         )
-        val candidates = roots.map { it.resolve(libraryName) } + roots.flatMap { root ->
+        // Architecture-specific outputs first so a stale build for another arch is never picked up.
+        val candidates = roots.flatMap { root ->
             architectureDirectories.map { architecture -> root.resolve(architecture).resolve(libraryName) }
-        }
+        } + roots.map { it.resolve(libraryName) }
         return candidates.firstOrNull { it.exists() }
     }
 
@@ -262,6 +263,11 @@ internal object NativePlayerBridge {
                 "aarch64", "arm64" -> listOf("arm64", "aarch64")
                 "amd64", "x64", "x86_64" -> listOf("x86_64")
                 else -> emptyList()
+            }
+            "windows" -> when (System.getProperty("os.arch").lowercase()) {
+                "aarch64", "arm64" -> listOf("arm64")
+                "x86" -> listOf("x86")
+                else -> listOf("x64")
             }
             else -> emptyList()
         }

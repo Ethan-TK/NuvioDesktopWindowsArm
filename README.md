@@ -22,7 +22,7 @@ Expect breaking changes with every update. Features, settings, stored data, and 
 
 Download the latest build from [GitHub Releases](https://github.com/NuvioMedia/NuvioDesktop/releases/latest).
 
-- Windows: MSI installer
+- Windows: MSI installer (x64 and arm64 / Windows on ARM)
 - macOS: DMG installer
 - Linux: DEB, RPM, Flatpak, or AppImage
 
@@ -72,6 +72,8 @@ Linux:
 ```bash
 ./gradlew :composeApp:packageReleaseDeb
 ```
+
+Windows on ARM (arm64): see [docs/windows-arm64.md](./docs/windows-arm64.md).
 
 The shared app is built with Kotlin Multiplatform and Compose Multiplatform.
 

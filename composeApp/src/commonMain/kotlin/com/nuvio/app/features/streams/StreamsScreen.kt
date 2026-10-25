@@ -106,6 +106,8 @@ import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watched.watchedItemKeys
 import com.nuvio.app.isDesktop
+import androidx.compose.ui.graphics.FilterQuality
+import com.nuvio.app.core.ui.rememberCheapBlurModel
 import com.nuvio.app.navigation.LocalUseNativeNavigation
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -475,13 +477,15 @@ private fun MobileStreamsLayout(
 ) {
     Box(modifier = modifier.fillMaxSize()) {
         if (backgroundMode == StreamBackgroundMode.Cinematic && heroArtwork != null) {
+            // Desktop: tiny upscaled source instead of a per-frame full-window blur (see CheapBlur.kt).
             AsyncImage(
-                model = heroArtwork,
+                model = rememberCheapBlurModel(heroArtwork, enabled = isDesktop),
                 contentDescription = null,
                 modifier = Modifier
                     .fillMaxSize()
-                    .blur(22.dp),
+                    .then(if (isDesktop) Modifier else Modifier.blur(22.dp)),
                 contentScale = ContentScale.Crop,
+                filterQuality = FilterQuality.High,
             )
             Box(
                 modifier = Modifier

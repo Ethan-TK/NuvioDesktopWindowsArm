@@ -19,7 +19,8 @@ import androidx.compose.ui.graphics.GraphicsContext
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalGraphicsContext
 import androidx.compose.ui.unit.Dp
@@ -29,7 +30,21 @@ internal val LocalPosterClickAnchor = staticCompositionLocalOf<((PosterZoomAncho
 
 internal class PosterLiftSource(private val graphicsContext: GraphicsContext) : RememberObserver {
     val layer = graphicsContext.createGraphicsLayer()
-    var bounds: Rect? = null
+    // Coordinates are captured cheaply on placement; the root-relative rect is only computed when a
+    // long-press/zoom actually needs it (previously every visible card recomputed it each scroll frame).
+    var coordinates: LayoutCoordinates? = null
+    private var lastBounds: Rect? = null
+    val bounds: Rect?
+        get() {
+            val current = coordinates?.takeIf { it.isAttached } ?: return lastBounds
+            val position = current.positionInRoot()
+            return Rect(
+                left = position.x,
+                top = position.y,
+                right = position.x + current.size.width,
+                bottom = position.y + current.size.height,
+            ).also { lastBounds = it }
+        }
     var isLifted by mutableStateOf(false)
         private set
     private var rememberCount = 0
@@ -83,15 +98,7 @@ internal fun Modifier.posterCardClickable(
             source.layer.record { this@drawWithContent.drawContent() }
             if (!source.isLifted) drawLayer(source.layer)
         }
-        .onGloballyPositioned { coordinates ->
-            val position = coordinates.positionInRoot()
-            source.bounds = Rect(
-                left = position.x,
-                top = position.y,
-                right = position.x + coordinates.size.width,
-                bottom = position.y + coordinates.size.height,
-            )
-        }
+        .onPlaced { coordinates -> source.coordinates = coordinates }
         .then(this)
     if (onClick == null && onLongClick == null) return posterModifier
     val interactionSource = remember { MutableInteractionSource() }
